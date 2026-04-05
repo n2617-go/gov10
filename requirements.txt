@@ -1,8 +1,9 @@
 streamlit
 yfinance
-pandas
-pandas-ta
-requests
 FinMind
-urllib3
-numpy
+pandas
+requests
+pytz
+tqdm
+ta
+extra-streamlit-components
