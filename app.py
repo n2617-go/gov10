@@ -1,737 +1,419 @@
 import streamlit as st
-import streamlit.components.v1 as components
-import requests
 import yfinance as yf
-from datetime import datetime
-import time
+import pandas as pd
+import requests
+import pytz
 import json
-import urllib.parse
+import os
+import streamlit.components.v1 as components
+from datetime import datetime, time as dt_time, timedelta
+from FinMind.data import DataLoader
+from ta.trend import SMAIndicator, MACD
+from ta.momentum import RSIIndicator, StochasticOscillator
+from ta.volatility import BollingerBands
 
-st.set_page_config(
-    page_title="台股看盤",
-    layout="centered",
-    initial_sidebar_state="collapsed"
-)
+# ===========================================================================
+# --- 0. 基礎設定 ---
+# ===========================================================================
+tw_tz         = pytz.timezone("Asia/Taipei")
+MARKET_OPEN      = dt_time(9, 0)
+MARKET_CLOSE     = dt_time(13, 30)
+AFTERHOURS_START = dt_time(14, 0)
+TG_SAVE_FILE  = "tg_config.json"
+USER_DATA_DIR = "user_data"
+ALERT_DIR     = "alert_state"
+LS_KEY        = "tw_stock_browser_id"
+# 預設股票結構增加門檻欄位
+DEFAULT_STOCKS = [{"id": "2330", "name": "台積電", "threshold": 3.0, "reset": 1.0}]
 
-# ══════════════════════════════════════════════════════════
-# CSS
-# ══════════════════════════════════════════════════════════
-CSS = r"""
-<style>
-@import url('https://fonts.googleapis.com/css2?family=Noto+Sans+TC:wght@400;500;700;900&family=JetBrains+Mono:wght@400;700&display=swap');
+os.makedirs(USER_DATA_DIR, exist_ok=True)
+os.makedirs(ALERT_DIR, exist_ok=True)
 
-*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+def now_tw() -> datetime:
+    return datetime.now(tw_tz)
 
-html, body, [data-testid="stAppViewContainer"] {
-    background: #0a0d14 !important;
-    color: #e2e8f0 !important;
-    font-family: 'Noto Sans TC', sans-serif !important;
-}
-[data-testid="stAppViewContainer"] {
-    background: radial-gradient(ellipse at 20% 0%, #0f1a2e 0%, #0a0d14 60%) !important;
-}
-#MainMenu, footer, header,
-[data-testid="stToolbar"],
-[data-testid="stDecoration"],
-[data-testid="stSidebarNav"] { display: none !important; }
+def is_market_open() -> bool:
+    n = now_tw()
+    if n.weekday() >= 5: return False
+    return MARKET_OPEN <= n.time() <= MARKET_CLOSE
 
-[data-testid="stAppViewBlockContainer"] {
-    padding: 1rem 0.75rem 5rem !important;
-    max-width: 480px !important;
-    margin: 0 auto !important;
-}
+def is_after_hours() -> bool:
+    n = now_tw(); t = n.time(); wday = n.weekday()
+    if wday >= 5: return True
+    if t >= AFTERHOURS_START or t < MARKET_OPEN: return True
+    return False
 
-.app-header {
-    display: flex; align-items: center;
-    justify-content: space-between;
-    padding: 1rem 0 1.25rem;
-    border-bottom: 1px solid rgba(255,255,255,0.06);
-    margin-bottom: 1.1rem;
-}
-.app-title { font-size: 1.35rem; font-weight: 900; letter-spacing: -0.02em; color: #f8fafc; }
-.app-title span { color: #38bdf8; }
-.app-time {
-    font-family: 'JetBrains Mono', monospace;
-    font-size: 0.68rem; color: #64748b;
-    text-align: right; line-height: 1.6;
-}
-.live-dot {
-    display: inline-block; width: 6px; height: 6px;
-    border-radius: 50%; background: #22c55e; margin-right: 5px;
-    animation: pulse 1.4s ease-in-out infinite;
-}
-@keyframes pulse {
-    0%,100% { opacity:1; transform:scale(1); }
-    50%      { opacity:.4; transform:scale(.8); }
-}
+def today_str() -> str:
+    return now_tw().strftime("%Y-%m-%d")
 
-/* 書籤提示橫幅 */
-.bookmark-hint {
-    background: linear-gradient(135deg, rgba(56,189,248,0.08), rgba(56,189,248,0.04));
-    border: 1px solid rgba(56,189,248,0.2);
-    border-radius: 12px;
-    padding: 0.65rem 0.9rem;
-    margin-bottom: 1rem;
-    font-size: 0.72rem;
-    color: #94a3b8;
-    line-height: 1.6;
-    display: flex;
-    align-items: flex-start;
-    gap: 0.5rem;
-}
-.bookmark-hint-icon { font-size: 0.9rem; flex-shrink: 0; margin-top: 1px; }
-.bookmark-hint strong { color: #38bdf8; }
-
-.add-section-title {
-    font-size: 0.7rem; font-weight: 700;
-    letter-spacing: 0.1em; text-transform: uppercase;
-    color: #38bdf8; margin-bottom: 0.7rem;
-}
-
-[data-testid="stTextInput"] input {
-    background: rgba(255,255,255,0.05) !important;
-    border: 1px solid rgba(255,255,255,0.1) !important;
-    border-radius: 10px !important;
-    color: #f1f5f9 !important;
-    font-family: 'JetBrains Mono', monospace !important;
-    font-size: 0.9rem !important;
-    padding: 0.55rem 0.75rem !important;
-}
-[data-testid="stTextInput"] input:focus {
-    border-color: rgba(56,189,248,0.5) !important;
-    box-shadow: 0 0 0 2px rgba(56,189,248,0.1) !important;
-}
-[data-testid="stTextInput"] label { display: none !important; }
-
-[data-testid="stButton"] button {
-    background: linear-gradient(135deg, #0ea5e9, #38bdf8) !important;
-    color: #0a0d14 !important;
-    font-family: 'Noto Sans TC', sans-serif !important;
-    font-weight: 700 !important;
-    font-size: 0.82rem !important;
-    border: none !important;
-    border-radius: 10px !important;
-    padding: 0.5rem 1.2rem !important;
-    width: 100% !important;
-    transition: opacity 0.2s !important;
-}
-[data-testid="stButton"] button:hover { opacity: 0.85 !important; }
-
-.stock-card {
-    background: linear-gradient(135deg, #111827 0%, #0f172a 100%);
-    border: 1px solid rgba(255,255,255,0.07);
-    border-radius: 16px;
-    padding: 1.1rem 1.1rem 0.9rem;
-    margin-bottom: 0.5rem;
-    position: relative;
-    overflow: hidden;
-    box-shadow: 0 4px 24px rgba(0,0,0,0.4);
-}
-.stock-card::before {
-    content: '';
-    position: absolute;
-    top: 0; left: 0; right: 0; height: 2px;
-    background: var(--accent, #38bdf8);
-    border-radius: 16px 16px 0 0;
-}
-.stock-card.up   { --accent: #ef4444; }
-.stock-card.down { --accent: #22c55e; }
-.stock-card.flat { --accent: #94a3b8; }
-
-.card-top {
-    display: flex; align-items: flex-start;
-    justify-content: space-between; margin-bottom: 0.85rem;
-}
-.stock-name { font-size: 1.05rem; font-weight: 700; color: #f1f5f9; line-height: 1.3; }
-.stock-code { font-family: 'JetBrains Mono', monospace; font-size: 0.72rem; color: #64748b; margin-top: 2px; }
-.price-block { text-align: right; }
-.price-main {
-    font-family: 'JetBrains Mono', monospace;
-    font-size: 1.6rem; font-weight: 700; line-height: 1; color: #f8fafc;
-}
-.price-change {
-    font-family: 'JetBrains Mono', monospace;
-    font-size: 0.78rem; font-weight: 700; margin-top: 3px;
-}
-.up-color   { color: #ef4444; }
-.down-color { color: #22c55e; }
-.flat-color { color: #94a3b8; }
-
-.ohlc-row {
-    display: grid; grid-template-columns: repeat(4,1fr);
-    gap: 0.3rem; background: rgba(255,255,255,0.03);
-    border-radius: 10px; padding: 0.55rem 0.5rem; margin-bottom: 0.85rem;
-}
-.ohlc-item { text-align: center; }
-.ohlc-label {
-    font-size: 0.6rem; color: #475569;
-    text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 3px;
-}
-.ohlc-val {
-    font-family: 'JetBrains Mono', monospace;
-    font-size: 0.78rem; color: #cbd5e1; font-weight: 500;
-}
-
-.card-divider { height: 1px; background: rgba(255,255,255,0.05); margin: 0.75rem 0; }
-
-.tech-section-title {
-    font-size: 0.65rem; font-weight: 700;
-    letter-spacing: 0.1em; text-transform: uppercase;
-    color: #475569; margin-bottom: 0.6rem;
-}
-.kd-row { display: flex; gap: 0.5rem; margin-bottom: 0.65rem; }
-.kd-chip {
-    flex: 1; background: rgba(255,255,255,0.04);
-    border-radius: 8px; padding: 0.45rem 0.6rem; text-align: center;
-}
-.kd-chip-label { font-size: 0.6rem; color: #64748b; text-transform: uppercase; letter-spacing: 0.06em; }
-.kd-chip-val {
-    font-family: 'JetBrains Mono', monospace;
-    font-size: 1rem; font-weight: 700; color: #e2e8f0; margin-top: 1px;
-}
-.kd-bar-wrap {
-    background: rgba(255,255,255,0.06);
-    border-radius: 99px; height: 4px; margin-top: 5px; overflow: hidden;
-}
-.kd-bar-fill {
-    height: 100%; border-radius: 99px;
-    background: var(--bar-color, #38bdf8);
-    width: var(--bar-width, 50%);
-}
-.momentum-row {
-    display: flex; align-items: center;
-    justify-content: space-between;
-    background: rgba(255,255,255,0.03);
-    border-radius: 8px; padding: 0.4rem 0.65rem; margin-bottom: 0.65rem;
-}
-.momentum-label { font-size: 0.7rem; color: #64748b; }
-.momentum-val { font-family: 'JetBrains Mono', monospace; font-size: 0.78rem; font-weight: 700; }
-
-.signal-row { display: flex; gap: 0.5rem; flex-wrap: wrap; align-items: center; }
-.badge {
-    display: inline-flex; align-items: center; gap: 4px;
-    font-size: 0.72rem; font-weight: 700;
-    border-radius: 99px; padding: 0.3rem 0.75rem;
-}
-.badge-signal-buy   { background: rgba(34,197,94,0.15);  color: #22c55e; border: 1px solid rgba(34,197,94,0.3); }
-.badge-signal-sell  { background: rgba(239,68,68,0.15);  color: #ef4444; border: 1px solid rgba(239,68,68,0.3); }
-.badge-signal-watch { background: rgba(148,163,184,0.1); color: #94a3b8; border: 1px solid rgba(148,163,184,0.2); }
-.badge-trend-up     { background: rgba(251,146,60,0.12); color: #fb923c; border: 1px solid rgba(251,146,60,0.25); }
-.badge-trend-down   { background: rgba(96,165,250,0.12); color: #60a5fa; border: 1px solid rgba(96,165,250,0.25); }
-
-.no-data { font-size: 0.75rem; color: #475569; text-align: center; padding: 0.5rem; font-style: italic; }
-.error-msg {
-    font-size: 0.75rem; color: #f87171;
-    background: rgba(239,68,68,0.08); border: 1px solid rgba(239,68,68,0.2);
-    border-radius: 8px; padding: 0.5rem 0.75rem; margin-top: 0.5rem;
-}
-.success-msg {
-    font-size: 0.75rem; color: #4ade80;
-    background: rgba(34,197,94,0.08); border: 1px solid rgba(34,197,94,0.2);
-    border-radius: 8px; padding: 0.5rem 0.75rem; margin-top: 0.5rem;
-}
-.card-gap { margin-bottom: 0.9rem; }
-.footer-note { text-align: center; font-size: 0.65rem; color: #334155; margin-top: 1.5rem; line-height: 1.7; }
-.element-container { margin-bottom: 0 !important; }
-</style>
-"""
-st.markdown(CSS, unsafe_allow_html=True)
-
-# ══════════════════════════════════════════════════════════
-# 持久化核心：query_params  ← Streamlit 原生，100% 可靠
-#
-# 原理：把 watchlist 編碼成 JSON 存在 URL 的 ?wl=... 參數。
-# Streamlit 每次 rerun 都能直接讀到，不依賴 JS 時序。
-# 使用者只需把含參數的網址加入書籤，下次直接開書籤即還原。
-# ══════════════════════════════════════════════════════════
-QP_KEY = "wl"
-
-DEFAULT_STOCKS = [
-    {"id": "2330", "name": "台積電"},
-    {"id": "2002", "name": "中鋼"},
-    {"id": "1326", "name": "台化"},
-    {"id": "6505", "name": "台塑化"},
-]
-
-
-def load_watchlist() -> list:
-    """從 query_params 讀取 watchlist，讀不到則回傳預設值"""
-    try:
-        raw = st.query_params.get(QP_KEY, "")
-        if raw:
-            data = json.loads(raw)
-            if isinstance(data, list) and len(data) > 0:
-                return data
-    except Exception:
-        pass
-    return DEFAULT_STOCKS.copy()
-
-
-def save_watchlist(watchlist: list):
-    """將 watchlist 寫入 query_params（同步更新網址）"""
-    st.query_params[QP_KEY] = json.dumps(watchlist, ensure_ascii=False)
-
-
-# ══════════════════════════════════════════════════════════
-# JS：自動把目前網址（含 ?wl=...）存入 localStorage，
-# 下次使用者直接開網址列時自動補回參數（輔助層）
-# ══════════════════════════════════════════════════════════
-def inject_localstorage_helper():
-    components.html("""
+# ===========================================================================
+# --- 1. 使用者識別與檔案管理 ---
+# ===========================================================================
+def get_browser_id_component():
+    components.html(f"""
     <script>
-    (function(){
-        var LS_KEY = 'twstock_url_v3';
-        try {
-            // 如果目前網址有 wl 參數，就存起來
-            if (window.parent.location.search.indexOf('wl=') !== -1) {
-                localStorage.setItem(LS_KEY, window.parent.location.href);
-            } else {
-                // 沒有參數時，嘗試從 localStorage 還原
-                var saved = localStorage.getItem(LS_KEY);
-                if (saved) {
-                    var savedUrl = new URL(saved);
-                    var wl = savedUrl.searchParams.get('wl');
-                    if (wl) {
-                        var cur = new URL(window.parent.location.href);
-                        cur.searchParams.set('wl', wl);
-                        window.parent.history.replaceState({}, '', cur.toString());
-                        // 重新載入讓 Streamlit 讀到新的 query_params
-                        window.parent.location.reload();
-                    }
-                }
-            }
-        } catch(e) {}
-    })();
+    (function() {{
+        const KEY = "{LS_KEY}";
+        let bid = localStorage.getItem(KEY);
+        if (!bid) {{
+            bid = (typeof crypto !== "undefined" && crypto.randomUUID)
+                  ? crypto.randomUUID()
+                  : Math.random().toString(36).slice(2) + Date.now().toString(36);
+            localStorage.setItem(KEY, bid);
+        }}
+        const url = new URL(window.parent.location.href);
+        if (url.searchParams.get("bid") !== bid) {{
+            url.searchParams.set("bid", bid);
+            window.parent.history.replaceState(null, "", url.toString());
+            window.parent.location.reload();
+        }}
+    }})();
     </script>
     """, height=0)
 
+def safe_bid(bid: str) -> str:
+    return "".join(c for c in bid if c.isalnum() or c in "-_")[:64]
 
-# ══════════════════════════════════════════════════════════
-# 股票名稱查詢
-# ══════════════════════════════════════════════════════════
-import re as _re
+def user_file(bid: str) -> str:
+    return os.path.join(USER_DATA_DIR, safe_bid(bid) + ".json")
 
-@st.cache_data(ttl=3600)
-def fetch_name_map() -> dict:
-    """
-    從 TWSE / OTC ISIN 頁面抓完整代碼→中文名稱對照表。
-    涵蓋上市(mode=2)、上櫃(mode=4)、全數字與含字母代碼（如 00981A）。
-    """
-    result = {}
-    headers = {"User-Agent": "Mozilla/5.0"}
-    for mode in ["2", "4"]:
+def load_user_stocks(bid: str) -> list:
+    path = user_file(bid)
+    if os.path.exists(path):
         try:
-            r = requests.get(
-                f"https://isin.twse.com.tw/isin/C_public.jsp?strMode={mode}",
-                headers=headers, timeout=12
-            )
-            r.encoding = "big5"
-            # 逐列解析：每個 <td> 的第一格格式為「代碼　名稱」（全形空格分隔）
-            rows = _re.findall(r'<tr[^>]*>(.*?)</tr>', r.text, _re.S)
-            for row in rows:
-                tds = _re.findall(r'<td[^>]*>(.*?)</td>', row, _re.S)
-                if not tds:
-                    continue
-                # 去除 HTML 標籤
-                cell = _re.sub(r'<[^>]+>', '', tds[0]).strip()
-                # 支援全形空格 \u3000 與一般空白兩種分隔
-                if '\u3000' in cell:
-                    parts = cell.split('\u3000', 1)
-                else:
-                    parts = cell.split(None, 1)   # 以任意空白切一次
-                if len(parts) == 2:
-                    code = parts[0].strip()
-                    name = parts[1].strip()
-                    # 代碼：4~7 碼，可包含英文字母（如 00631L、00981A）
-                    if code and name and _re.match(r'^[0-9A-Za-z]{4,7}$', code):
-                        result[code] = name
-        except Exception:
-            pass
-    return result
-
-
-@st.cache_data(ttl=300)
-def fetch_name_from_twse_api(stock_id: str) -> str:
-    """
-    用 TWSE 即時 API 查單支股票名稱（上市 + 上櫃）。
-    非交易時間仍可查到靜態名稱欄位 'n'。
-    快取 5 分鐘。
-    """
-    headers = {"User-Agent": "Mozilla/5.0", "Referer": "https://mis.twse.com.tw/"}
-    for market in ["tse", "otc"]:
-        try:
-            url = (
-                "https://mis.twse.com.tw/stock/api/getStockInfo.jsp"
-                f"?ex_ch={market}_{stock_id}.tw&json=1"
-            )
-            r = requests.get(url, headers=headers, timeout=8)
-            arr = r.json().get("msgArray", [])
-            if arr and arr[0].get("n"):
-                return arr[0]["n"]
-        except Exception:
-            pass
-    return ""
-
-
-def get_stock_name(stock_id: str) -> str:
-    """
-    取得中文名稱，三層備援：
-    1. TWSE/OTC 即時 API（最快，非交易時間也有靜態欄位）
-    2. ISIN 名稱對照表（最全，含所有 ETF 含字母代碼）
-    3. 代碼本身（最後備援）
-    """
-    # 層 1：即時 API
-    name = fetch_name_from_twse_api(stock_id)
-    if name:
-        return name
-    # 層 2：ISIN 對照表
-    name_map = fetch_name_map()
-    if stock_id in name_map:
-        return name_map[stock_id]
-    # 層 2b：大小寫不敏感比對（部分 ETF 代碼大小寫不一致）
-    sid_upper = stock_id.upper()
-    for k, v in name_map.items():
-        if k.upper() == sid_upper:
-            return v
-    return stock_id   # 最後備援
-
-
-def verify_stock(stock_id: str):
-    """
-    驗證台股代碼，回傳 (有效: bool, 中文名稱: str)。
-    策略：先用即時 API 驗存在性；若非交易時間則改查 ISIN 表；
-    最後用 yfinance 確認歷史資料存在。
-    """
-    # 層 1：TWSE/OTC 即時 API
-    headers = {"User-Agent": "Mozilla/5.0", "Referer": "https://mis.twse.com.tw/"}
-    for market in ["tse", "otc"]:
-        try:
-            url = (
-                "https://mis.twse.com.tw/stock/api/getStockInfo.jsp"
-                f"?ex_ch={market}_{stock_id}.tw&json=1"
-            )
-            r = requests.get(url, headers=headers, timeout=8)
-            arr = r.json().get("msgArray", [])
-            if arr and arr[0].get("n"):
-                return True, arr[0]["n"]
-        except Exception:
-            pass
-
-    # 層 2：ISIN 對照表（含字母代碼、非交易時間皆可查）
-    name_map = fetch_name_map()
-    sid_upper = stock_id.upper()
-    for k, v in name_map.items():
-        if k.upper() == sid_upper:
-            return True, v
-
-    # 層 3：yfinance 確認存在（名稱從對照表補）
-    try:
-        ticker = yf.Ticker(f"{stock_id}.TW")
-        df = ticker.history(period="5d")
-        if not df.empty:
-            name = name_map.get(stock_id, stock_id)
-            return True, name
-    except Exception:
-        pass
-
-    return False, ""
-
-
-# ══════════════════════════════════════════════════════════
-# 股價資料
-# ══════════════════════════════════════════════════════════
-def fetch_twse_realtime(stock_ids: list) -> list:
-    tse = [f"tse_{sid}.tw" for sid in stock_ids]
-    otc = [f"otc_{sid}.tw" for sid in stock_ids]
-    ex_ch = "|".join(tse + otc)
-    url = f"https://mis.twse.com.tw/stock/api/getStockInfo.jsp?ex_ch={ex_ch}&json=1"
-    headers = {"User-Agent": "Mozilla/5.0", "Referer": "https://mis.twse.com.tw/"}
-    try:
-        return requests.get(url, headers=headers, timeout=10).json().get("msgArray", [])
-    except Exception:
-        return []
-
-
-def fetch_yf_hist(stock_id: str):
-    try:
-        df = yf.Ticker(f"{stock_id}.TW").history(period="3mo")
-        return None if df.empty else df
-    except Exception:
-        return None
-
-
-def get_realtime_price(tw, yf_close):
-    try:
-        z = tw.get("z")
-        if z not in ["-", "", None, "0"]:
-            return float(z)
-        b = tw.get("b")
-        if b:
-            return float(b.split("_")[0])
-        a = tw.get("a")
-        if a:
-            return float(a.split("_")[0])
-    except Exception:
-        pass
-    return yf_close
-
-
-def calculate_kd(df, period=9):
-    low_min  = df["Low"].rolling(window=period).min()
-    high_max = df["High"].rolling(window=period).max()
-    rsv = (df["Close"] - low_min) / (high_max - low_min) * 100
-    df["K"] = rsv.ewm(com=2).mean()
-    df["D"] = df["K"].ewm(com=2).mean()
-    return df
-
-
-def calculate_momentum(df, period=10):
-    df["Momentum"] = df["Close"] - df["Close"].shift(period)
-    return df
-
-
-def analyze_signal(df):
-    if len(df) < 2:
-        return "觀望", "無法判斷"
-    l, p = df.iloc[-1], df.iloc[-2]
-    sig = "觀望"
-    if p["K"] < p["D"] and l["K"] > l["D"]:
-        sig = "買進 (黃金交叉)"
-    elif p["K"] > p["D"] and l["K"] < l["D"]:
-        sig = "賣出 (死亡交叉)"
-    trend = "上升動能" if l["Momentum"] > 0 else "下跌動能"
-    return sig, trend
-
-
-def get_stock_data(twse_data, stock):
-    code, name = stock["id"], stock["name"]
-    tw = next((x for x in twse_data if x.get("c") == code), None)
-    df = fetch_yf_hist(code)
-
-    prev_close = open_price = high = low = yf_close = None
-    if df is not None and len(df) >= 2:
-        prev_close = float(df["Close"].iloc[-2])
-        open_price = float(df["Open"].iloc[-1])
-        high       = float(df["High"].iloc[-1])
-        low        = float(df["Low"].iloc[-1])
-        yf_close   = float(df["Close"].iloc[-1])
-
-    price = get_realtime_price(tw, yf_close) if tw else yf_close
-    if prev_close is None and tw:
-        try:    prev_close = float(tw.get("y") or 0)
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            return data if isinstance(data, list) else list(DEFAULT_STOCKS)
         except: pass
+    return list(DEFAULT_STOCKS)
 
-    k = d = momentum = None
-    signal = trend = "無資料"
-    if df is not None:
-        df = calculate_kd(df)
-        df = calculate_momentum(df)
-        signal, trend = analyze_signal(df)
-        l = df.iloc[-1]
-        k, d, momentum = float(l["K"]), float(l["D"]), float(l["Momentum"])
+def save_user_stocks(bid: str, stocks: list):
+    try:
+        with open(user_file(bid), "w", encoding="utf-8") as f:
+            json.dump(stocks, f, ensure_ascii=False, indent=2)
+    except: pass
 
-    change     = (price - prev_close) if (prev_close and price) else 0.0
-    change_pct = (change / prev_close * 100) if prev_close else 0.0
+# ===========================================================================
+# --- 2. 通知狀態與 Telegram 設定 ---
+# ===========================================================================
+def alert_state_file(bid: str) -> str:
+    return os.path.join(ALERT_DIR, safe_bid(bid) + "_alert.json")
 
-    return dict(name=name, code=code, price=price, prev_close=prev_close,
-                open=open_price, high=high, low=low,
-                change=change, change_pct=change_pct,
-                K=k, D=d, Momentum=momentum, signal=signal, trend=trend)
+def load_alert_state(bid: str) -> dict:
+    path = alert_state_file(bid); today = today_str()
+    if os.path.exists(path):
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if data.get("date") == today: return data
+        except: pass
+    return {"date": today, "states": {}}
 
+def save_alert_state(bid: str, state: dict):
+    try:
+        with open(alert_state_file(bid), "w", encoding="utf-8") as f:
+            json.dump(state, f, ensure_ascii=False, indent=2)
+    except: pass
 
-# ══════════════════════════════════════════════════════════
-# 畫面輔助
-# ══════════════════════════════════════════════════════════
-def fmt(v, d=2):
-    return f"{v:.{d}f}" if v is not None else "－"
+def load_tg_config() -> dict:
+    if os.path.exists(TG_SAVE_FILE):
+        try:
+            with open(TG_SAVE_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except: pass
+    return {"tg_token": "", "tg_chat_id": "", "tg_threshold": 3.0, "tg_reset": 1.0, "finmind_token": ""}
 
-def direction_class(c):
-    if c > 0: return "up",   "up-color",   "▲"
-    if c < 0: return "down", "down-color",  "▼"
-    return "flat", "flat-color", "－"
+# ===========================================================================
+# --- 3. FinMind & 數據抓取邏輯 (保留原功能) ---
+# ===========================================================================
+def get_finmind_loader():
+    dl = DataLoader()
+    token = st.session_state.get("finmind_token", "")
+    if token: dl.login_by_token(api_token=token)
+    return dl
 
-def sig_cls(s):
-    if "買進" in s: return "badge-signal-buy"
-    if "賣出" in s: return "badge-signal-sell"
-    return "badge-signal-watch"
+@st.cache_data(ttl=60)
+def fetch_all_quotes() -> dict:
+    try:
+        dl = get_finmind_loader()
+        df = dl.taiwan_stock_quote(stock_id="")
+        if df is None or df.empty: return {}
+        result = {}
+        for _, row in df.iterrows():
+            sid = str(row.get("stock_id", ""))
+            if not sid: continue
+            result[sid] = {
+                "price": float(row.get("close", row.get("price", 0))),
+                "pct": float(row.get("change_rate", row.get("ChangeRate", 0))),
+                "open": float(row.get("open", 0))
+            }
+        return result
+    except: return {}
 
-def trend_cls(t):
-    return "badge-trend-up" if "上升" in t else "badge-trend-down"
+def get_quote(stock_id: str) -> dict:
+    return fetch_all_quotes().get(stock_id, {})
 
-def kd_bar(val, color):
-    pct = min(max(val, 0), 100) if val is not None else 50
-    return (
-        '<div class="kd-bar-wrap"><div class="kd-bar-fill" style="'
-        f'--bar-width:{pct:.0f}%;--bar-color:{color};"></div></div>'
-    )
+def fetch_momentum_analysis(stock_id: str, pct: float, tg_threshold: float) -> dict:
+    try:
+        dl = get_finmind_loader(); today = today_str()
+        df = dl.taiwan_stock_minute(stock_id=stock_id, start_date=today, end_date=today)
+        if df is None or df.empty: return {}
+        vol_col = next((c for c in ["volume", "Volume", "vol"] if c in df.columns), None)
+        if not vol_col: return {}
+        df[vol_col] = pd.to_numeric(df[vol_col], errors="coerce").fillna(0)
+        recent = df.tail(6)
+        if len(recent) < 2: return {}
+        cur_vol = float(recent.iloc[-1][vol_col])
+        avg_vol = float(recent.iloc[:-1][vol_col].mean())
+        ratio = cur_vol / avg_vol if avg_vol > 0 else 0.0
+        
+        # 意涵判斷
+        is_up, is_down = pct >= tg_threshold, pct <= -tg_threshold
+        if is_up and ratio >= 1.5: impl = "🚀 短線意涵：帶量突破"
+        elif is_up and ratio < 1.0: impl = "⚠️ 短線意涵：虛假拉抬"
+        elif is_down and ratio >= 1.5: impl = "💣 短線意涵：帶量殺盤"
+        elif is_down and ratio < 1.0: impl = "🔍 短線意涵：洗盤觀察"
+        else: impl = ""
+        
+        label = f"🔥 爆量({ratio:.1f}倍)" if ratio >= 2.0 else f"📈 放量({ratio:.1f}倍)" if ratio >= 1.5 else "➡️ 量能正常" if ratio >= 1.0 else f"📉 縮量({ratio*100:.0f}%)"
+        return {"cur_vol": int(cur_vol), "avg_vol": int(avg_vol), "ratio": round(ratio, 2), "momentum_label": label, "short_impl": impl}
+    except: return {}
 
+# ===========================================================================
+# --- 4. 盤後分析與技術指標 ---
+# ===========================================================================
+def fetch_finmind_close_volume(stock_id: str) -> tuple:
+    try:
+        dl = get_finmind_loader(); today = today_str()
+        start = (now_tw() - timedelta(days=7)).strftime("%Y-%m-%d")
+        df = dl.taiwan_stock_daily(stock_id=stock_id, start_date=start, end_date=today)
+        if df is None or df.empty: return 0.0, ""
+        row = df.sort_values("date").iloc[-1]
+        for col in ["Trading_Volume", "volume", "Volume"]:
+            if col in row.index: return round(float(row[col])/1000), str(row.get("date",""))
+        return 0.0, ""
+    except: return 0.0, ""
 
-def render_card(row, idx):
-    cc, pc, arrow = direction_class(row["change"])
+def run_afterhours_analysis(bid: str, stock: dict, pct: float, hist_df: pd.DataFrame, tg_threshold: float) -> str:
+    sid = stock["id"]; alert_state = load_alert_state(bid); s = alert_state.setdefault("states", {}).setdefault(sid, {})
+    if s.get("ah_date") == today_str() and s.get("ah_threshold") == tg_threshold: return s.get("ah_impl", "")
+    
+    # 計算 5MAV
+    vols = pd.to_numeric(hist_df["Volume"], errors="coerce").dropna()
+    mav5 = round(vols.iloc[-5:].mean()/1000) if len(vols) >= 5 else 0
+    if mav5 <= 0: return ""
+    
+    close_vol, _ = fetch_finmind_close_volume(sid)
+    if close_vol <= 0: return ""
+    
+    ratio = close_vol / mav5
+    if pct >= tg_threshold and ratio > 1.1: impl = "📈 盤後意涵：量增上漲，可考慮留倉"
+    elif pct >= tg_threshold and ratio < 0.9: impl = "⚠️ 盤後意涵：量縮上漲，不宜追高"
+    elif pct <= -tg_threshold and ratio > 1.1: impl = "💣 盤後意涵：趨勢轉弱，建議避開"
+    elif pct <= -tg_threshold and ratio < 0.9: impl = "🔍 盤後意涵：量縮下跌，可尋買點"
+    else: impl = ""
+    
+    s.update({"ah_impl": impl, "ah_date": today_str(), "ah_threshold": tg_threshold, "ah_vol": int(close_vol), "ah_mav5": int(mav5), "ah_ratio": round(ratio,2)})
+    save_alert_state(bid, alert_state)
+    return impl
 
-    ohlc = "".join(
-        f'<div class="ohlc-item"><div class="ohlc-label">{lb}</div>'
-        f'<div class="ohlc-val">{fmt(v)}</div></div>'
-        for lb, v in [("昨收", row["prev_close"]), ("開盤", row["open"]),
-                      ("最高", row["high"]),        ("最低", row["low"])]
-    )
+def get_history_cached(stock_id: str) -> pd.DataFrame:
+    cache = st.session_state.hist_cache; today = today_str()
+    if stock_id in cache and cache[stock_id]["cached_date"] == today: return cache[stock_id]["df"].copy()
+    df = pd.DataFrame()
+    for suffix in [".TW", ".TWO"]:
+        try:
+            temp = yf.download(stock_id + suffix, period="6mo", progress=False)
+            if not temp.empty: df = temp; break
+        except: continue
+    if df.empty: return pd.DataFrame()
+    if isinstance(df.columns, pd.MultiIndex): df.columns = df.columns.get_level_values(0)
+    df = df.astype(float).ffill()
+    df.index = pd.to_datetime(df.index).normalize()
+    df = df[df.index <= (pd.Timestamp(today) - timedelta(days=1))]
+    cache[stock_id] = {"df": df, "cached_date": today}
+    return df.copy()
 
-    if row["K"] is not None:
-        kd_sec = (
-            '<div class="kd-row">'
-            '<div class="kd-chip"><div class="kd-chip-label">K 值</div>'
-            f'<div class="kd-chip-val">{fmt(row["K"])}</div>{kd_bar(row["K"], "#38bdf8")}</div>'
-            '<div class="kd-chip"><div class="kd-chip-label">D 值</div>'
-            f'<div class="kd-chip-val">{fmt(row["D"])}</div>{kd_bar(row["D"], "#f472b6")}</div>'
-            '</div>'
-        )
-        mc = "#22c55e" if row["Momentum"] > 0 else "#ef4444"
-        mom_sec = (
-            '<div class="momentum-row"><span class="momentum-label">動能指標 (10日)</span>'
-            f'<span class="momentum-val" style="color:{mc};">{fmt(row["Momentum"])}</span></div>'
-        )
-        st_text, tr_text = row["signal"], row["trend"]
+def calc_indicators(df: pd.DataFrame):
+    if len(df) < 30: return None
+    close = pd.Series(df["Close"].values.flatten(), index=df.index).astype(float)
+    high = pd.Series(df["High"].values.flatten(), index=df.index).astype(float)
+    low = pd.Series(df["Low"].values.flatten(), index=df.index).astype(float)
+    try:
+        df = df.copy()
+        df["MA5"] = SMAIndicator(close, window=5).sma_indicator()
+        df["MA10"] = SMAIndicator(close, window=10).sma_indicator()
+        df["MA20"] = SMAIndicator(close, window=20).sma_indicator()
+        stoch = StochasticOscillator(high, low, close, window=9)
+        df["K"], df["D"] = stoch.stoch(), stoch.stoch_signal()
+        df["MACD_diff"] = MACD(close).macd_diff()
+        df["RSI"] = RSIIndicator(close).rsi()
+        df["BBM"] = BollingerBands(close).bollinger_mavg()
+        return df
+    except: return None
+
+@st.cache_data(ttl=60)
+def fetch_and_analyze(stock_id: str):
+    hist_df = get_history_cached(stock_id)
+    if hist_df.empty: return None
+    
+    # 縫合今日棒
+    if is_market_open():
+        quote = get_quote(stock_id)
+        if quote:
+            today = pd.Timestamp(today_str())
+            prev_c = float(hist_df.iloc[-1]["Close"])
+            row = pd.Series({"Open": quote.get("open", prev_c), "High": max(quote.get("open", prev_c), quote["price"]), 
+                             "Low": min(quote.get("open", prev_c), quote["price"]), "Close": quote["price"], "Volume": 0.0}, name=today)
+            df = pd.concat([hist_df, pd.DataFrame([row])])
+            src = "📡 即時縫合"
+        else: df = hist_df; src = "🗂 歷史資料"
+    else: df = hist_df; src = "🗂 歷史資料"
+    
+    df = calc_indicators(df)
+    if df is None: return None
+    last, prev = df.iloc[-1], df.iloc[-2]
+    
+    # 評分邏輯
+    score, details = 0, []
+    if last["MA5"] > last["MA10"] > last["MA20"]: details.append("✅ 均線多頭"); score += 1
+    if prev["K"] <= prev["D"] and last["K"] > last["D"] and (last["K"]-last["D"])>=1:
+        lbl = "✅ KD 低檔金叉" if (last["K"]+last["D"])/2 < 20 else "✅ KD 標準金叉"
+        details.append(lbl); score += 1
+    if last["MACD_diff"] > 0: details.append("✅ MACD 轉正"); score += 1
+    if last["RSI"] > 50: details.append("✅ RSI 強勢"); score += 1
+    if last["Close"] > last["BBM"]: details.append("✅ 站穩月線"); score += 1
+    
+    dm = {5:("S","🔥續抱","red"), 4:("A","🚀偏多","orange"), 3:("B","📈試單","green"), 2:("C","⚖️觀望","blue"), 1:("D","📉避險","gray"), 0:("E","🚫不進場","black")}
+    grade, action, color = dm[score]
+    
+    # 漲跌幅
+    if is_market_open():
+        q = get_quote(stock_id); pct = q.get("pct", 0.0); price = q.get("price", float(last["Close"]))
     else:
-        kd_sec  = '<div class="no-data">歷史資料不足，無法計算技術指標</div>'
-        mom_sec = ""
-        st_text, tr_text = "資料不足", ""
+        pct = (float(last["Close"]) - float(prev["Close"])) / float(prev["Close"]) * 100; price = float(last["Close"])
+        
+    return {"price": price, "pct": pct, "grade": grade, "action": action, "color": color, "details": details, "k": float(last["K"]), "d": float(last["D"]), "source": src, "hist_df": hist_df}
 
-    tr_badge = f'<span class="badge {trend_cls(tr_text)}">{tr_text}</span>' if tr_text else ""
-    chg_str  = f'{arrow} {abs(row["change"]):.2f} ({abs(row["change_pct"]):.2f}%)' if row["change"] else "－"
+# ===========================================================================
+# --- 5. 通知邏輯 (支援個別門檻) ---
+# ===========================================================================
+def check_and_notify(bid: str, stock: dict, pct: float, res: dict, tg_token: str, tg_chat_id: str, tg_threshold: float, tg_reset: float) -> str:
+    if not tg_token or not tg_chat_id: return "⚪ 未設定通知"
+    sid = stock["id"]; alert_state = load_alert_state(bid); s = alert_state.setdefault("states", {}).setdefault(sid, {"alerted":False, "momentum":{}})
+    abs_pct = abs(pct)
+    
+    if s["alerted"]:
+        if abs_pct <= tg_reset:
+            s.update({"alerted": False, "alerted_at": "", "momentum": {}})
+            save_alert_state(bid, alert_state)
+            return f"🔓 已重置 ({pct:+.2f}%)"
+        mom = s.get("momentum", {}); m_lbl = mom.get("momentum_label", ""); s_impl = mom.get("short_impl", "")
+        return f"🔒 鎖定({s.get('alerted_at')}) " + (m_lbl if m_lbl else "") + (f" {s_impl}" if s_impl else "")
+    else:
+        if abs_pct >= tg_threshold:
+            momentum = fetch_momentum_analysis(sid, pct, tg_threshold)
+            s["momentum"] = momentum
+            msg = f"🔔 <b>【價格異動】</b>\n標的：{stock['name']}({sid})\n股價：{res['price']:.2f} ({pct:+.2f}%)\n評級：{res['grade']} ({res['action']})\n指標：{', '.join(res['details'])}\n門檻：{tg_threshold}% / {tg_reset}%"
+            if momentum.get("short_impl"): msg += f"\n\n{momentum['short_impl']}\n{momentum['momentum_label']}"
+            requests.post(f"https://api.telegram.org/bot{tg_token}/sendMessage", json={"chat_id":tg_chat_id, "text":msg, "parse_mode":"HTML"})
+            s.update({"alerted": True, "alerted_at": now_tw().strftime("%H:%M")})
+            save_alert_state(bid, alert_state)
+            return f"✅ 已發送({s['alerted_at']})"
+        return f"⚪ 監控中({pct:+.2f}%)"
 
-    st.markdown(
-        f'<div class="stock-card {cc}">'
-        '<div class="card-top"><div>'
-        f'<div class="stock-name">{row["name"]}</div>'
-        f'<div class="stock-code">{row["code"]} · TW</div>'
-        '</div><div class="price-block">'
-        f'<div class="price-main">{fmt(row["price"])}</div>'
-        f'<div class="price-change {pc}">{chg_str}</div>'
-        '</div></div>'
-        f'<div class="ohlc-row">{ohlc}</div>'
-        '<div class="card-divider"></div>'
-        '<div class="tech-section-title">技術指標</div>'
-        f'{kd_sec}{mom_sec}'
-        f'<div class="signal-row"><span class="badge {sig_cls(st_text)}">{st_text}</span>{tr_badge}</div>'
-        '</div><div class="card-gap"></div>',
-        unsafe_allow_html=True,
-    )
+# ===========================================================================
+# --- 6. 介面設計 ---
+# ===========================================================================
+st.set_page_config(page_title="台股決策系統 V8.0", layout="centered")
 
-    if st.button(f"移除  {row['name']} ({row['code']})", key=f"del_{row['code']}_{idx}"):
-        st.session_state.watchlist = [
-            s for s in st.session_state.watchlist if s["id"] != row["code"]
-        ]
-        save_watchlist(st.session_state.watchlist)
-        st.rerun()
+st.markdown("""
+<style>
+.block-container { padding-top: 1rem !important; }
+.stock-card { background: #1e1e2e; border: 1px solid rgba(255,255,255,0.08); border-radius: 12px; padding: 12px; margin-bottom: 8px; }
+.card-header { display: flex; justify-content: space-between; align-items: center; }
+.card-title { font-size: 1.2rem; font-weight: 700; }
+.card-price { font-size: 1.5rem; font-weight: 800; text-align: right; }
+.badge { display: inline-block; padding: 2px 8px; border-radius: 10px; font-size: 0.8rem; margin-right: 4px; background: rgba(255,255,255,0.1); }
+.action-red { color: #ff6b6b; } .action-orange { color: #f6ad55; } .action-green { color: #51cf66; }
+.threshold-box { font-size: 0.7rem; color: #a0aec0; margin-top: 4px; }
+</style>
+""", unsafe_allow_html=True)
 
+st.title("🤖 台股 AI 分級決策 V8.0")
+browser_id = st.query_params.get("bid", "")
+if not browser_id: get_browser_id_component(); st.stop()
 
-# ══════════════════════════════════════════════════════════
-# 主程式
-# ══════════════════════════════════════════════════════════
+# 自動重新整理
+if is_market_open():
+    components.html("<script>setTimeout(function(){window.parent.location.reload();}, 60000);</script>", height=0)
+    st.success("🟢 開盤中 - 每分鐘自動掃描")
 
-# ① 每次 run 最開始先從 query_params 讀取 watchlist
-#    （query_params 在 Streamlit 啟動時就已解析完畢，不存在時序問題）
-if "watchlist" not in st.session_state:
-    st.session_state.watchlist = load_watchlist()
-    # 自動修補：若某支股票的 name 就是 id（代表之前沒查到中文名稱），補回正確名稱
-    needs_save = False
-    for s in st.session_state.watchlist:
-        if s["name"] == s["id"]:
-            recovered = get_stock_name(s["id"])
-            if recovered != s["id"]:
-                s["name"] = recovered
-                needs_save = True
-    save_watchlist(st.session_state.watchlist)
+# 側邊欄設定
+with st.sidebar:
+    st.header("⚙️ 全域預設設定")
+    st.session_state.finmind_token = st.text_input("FinMind Token", type="password", value=load_tg_config()["finmind_token"])
+    st.session_state.tg_token = st.text_input("Bot Token", type="password", value=load_tg_config()["tg_token"])
+    st.session_state.tg_chat_id = st.text_input("Chat ID", value=load_tg_config()["tg_chat_id"])
+    st.session_state.tg_threshold = st.number_input("預設觸發門檻%", value=3.0, step=0.5)
+    st.session_state.tg_reset = st.number_input("預設重置門檻%", value=1.0, step=0.5)
+    if st.button("💾 儲存全域設定"): 
+        with open(TG_SAVE_FILE,"w") as f: json.dump({"tg_token":st.session_state.tg_token, "tg_chat_id":st.session_state.tg_chat_id, "tg_threshold":st.session_state.tg_threshold, "tg_reset":st.session_state.tg_reset, "finmind_token":st.session_state.finmind_token}, f)
+        st.success("已儲存")
 
-# ② 注入 localStorage 輔助（把目前網址同步存/還原，為雙重保險）
-inject_localstorage_helper()
+# 新增股票
+with st.container(border=True):
+    c1, c2, c3 = st.columns([1,1,1])
+    nid = c1.text_input("代號")
+    nname = c2.text_input("名稱")
+    if c3.button("➕ 新增股票", use_container_width=True) and nid and nname:
+        st.session_state.my_stocks.append({"id":nid, "name":nname, "threshold":st.session_state.tg_threshold, "reset":st.session_state.tg_reset})
+        save_user_stocks(browser_id, st.session_state.my_stocks); st.rerun()
 
-if "add_msg"  not in st.session_state: st.session_state.add_msg  = ""
-if "add_type" not in st.session_state: st.session_state.add_type = ""
+# 股票列表顯示
+st.session_state.my_stocks = load_user_stocks(browser_id)
+if "hist_cache" not in st.session_state: st.session_state.hist_cache = {}
 
-now = datetime.now().strftime("%Y/%m/%d %H:%M:%S")
+for idx, stock in enumerate(st.session_state.my_stocks):
+    res = fetch_and_analyze(stock["id"])
+    if res:
+        # 決定門檻
+        s_th = stock.get("threshold", st.session_state.tg_threshold)
+        s_rs = stock.get("reset", st.session_state.tg_reset)
+        
+        # 通知邏輯
+        alert_msg = check_and_notify(browser_id, stock, res["pct"], res, st.session_state.tg_token, st.session_state.tg_chat_id, s_th, s_rs)
+        ah_impl = run_afterhours_analysis(browser_id, stock, res["pct"], res["hist_df"], s_th) if is_after_hours() else ""
 
-# ── 頂部標題 ─────────────────────────────────────────────
-st.markdown(
-    '<div class="app-header">'
-    '<div class="app-title">📊 台股<span>看盤</span></div>'
-    f'<div class="app-time"><span class="live-dot"></span>即時更新<br>{now}</div>'
-    '</div>',
-    unsafe_allow_html=True,
-)
-
-# ── 書籤提示 ─────────────────────────────────────────────
-st.markdown(
-    '<div class="bookmark-hint">'
-    '<span class="bookmark-hint-icon">🔖</span>'
-    '<span>將目前網址加入<strong>書籤</strong>，下次直接開啟書籤即可還原您的關注清單</span>'
-    '</div>',
-    unsafe_allow_html=True,
-)
-
-# ── 新增股票 ──────────────────────────────────────────────
-with st.expander("➕ 新增關注股票", expanded=False):
-    st.markdown(
-        '<div class="add-section-title">輸入台股代碼（上市 / 上櫃 / ETF）</div>',
-        unsafe_allow_html=True,
-    )
-    new_id = st.text_input(
-        "代碼", placeholder="例如：0050、2454、6669",
-        label_visibility="collapsed", key="new_stock_input",
-    )
-    if st.button("查詢並加入", key="add_btn"):
-        cid = new_id.strip()
-        if not cid:
-            st.session_state.add_msg  = "請輸入股票代碼"
-            st.session_state.add_type = "err"
-        elif any(s["id"] == cid for s in st.session_state.watchlist):
-            st.session_state.add_msg  = f"「{cid}」已在關注清單中"
-            st.session_state.add_type = "err"
-        else:
-            with st.spinner("查詢中…"):
-                valid, name = verify_stock(cid)
-            if valid:
-                st.session_state.watchlist.append({"id": cid, "name": name})
-                save_watchlist(st.session_state.watchlist)   # ← 立即寫入 query_params
-                st.session_state.add_msg  = f"✅ 已加入「{name}（{cid}）」"
-                st.session_state.add_type = "ok"
-                st.rerun()
-            else:
-                st.session_state.add_msg  = f"找不到代碼「{cid}」，請確認為台股代碼"
-                st.session_state.add_type = "err"
-
-    if st.session_state.add_msg:
-        st.markdown(
-            f'<div class="{"success-msg" if st.session_state.add_type == "ok" else "error-msg"}">'
-            f'{st.session_state.add_msg}</div>',
-            unsafe_allow_html=True,
-        )
-
-# ── 股票清單 ──────────────────────────────────────────────
-if not st.session_state.watchlist:
-    st.markdown(
-        '<div style="text-align:center;padding:3rem 1rem;color:#475569;">'
-        '<div style="font-size:2.5rem;margin-bottom:0.75rem;">📭</div>'
-        '<div style="font-size:0.9rem;font-weight:700;color:#64748b;">關注清單是空的</div>'
-        '<div style="font-size:0.75rem;margin-top:0.4rem;">點上方「新增關注股票」來加入</div>'
-        '</div>',
-        unsafe_allow_html=True,
-    )
-else:
-    ids       = [s["id"] for s in st.session_state.watchlist]
-    twse_data = fetch_twse_realtime(ids)
-    for idx, stock in enumerate(st.session_state.watchlist):
-        row = get_stock_data(twse_data, stock)
-        render_card(row, idx)
-
-# ── 頁尾 ──────────────────────────────────────────────────
-st.markdown(
-    '<div class="footer-note">'
-    "資料來源：TWSE 即時 API + Yahoo Finance<br>"
-    "每 15 秒自動更新 ／ 僅供參考，不構成投資建議"
-    "</div>",
-    unsafe_allow_html=True,
-)
-
-time.sleep(15)
-st.rerun()
+        # UI 卡片
+        col_card, col_ctrl = st.columns([7, 3])
+        with col_card:
+            pct_color = "#ff6b6b" if res["pct"] > 0 else "#51cf66" if res["pct"] < 0 else "#868e96"
+            st.markdown(f"""
+            <div class="stock-card">
+                <div class="card-header">
+                    <span class="card-title">{stock['name']} ({stock['id']})</span>
+                    <div class="card-price" style="color:{pct_color}">{res['price']:.2f}<br><span style="font-size:0.9rem">{res['pct']:+.2f}%</span></div>
+                </div>
+                <div>
+                    <span class="badge" style="color:{res['color']}">{res['grade']} {res['action']}</span>
+                    <span class="badge">{res['source']}</span>
+                </div>
+                <div style="font-size:0.8rem; margin-top:5px; opacity:0.8;">指標：{", ".join(res['details'])}</div>
+                <div style="font-size:0.8rem; color:#f6ad55; margin-top:5px;">{ah_impl}</div>
+                <div class="threshold-box">🔔 {alert_msg} (門檻: {s_th}% / {s_rs}%)</div>
+            </div>
+            """, unsafe_allow_html=True)
+        
+        with col_ctrl:
+            st.caption("個別門檻設定")
+            new_th = st.number_input("觸發%", value=float(s_th), step=0.1, key=f"th_{stock['id']}", label_visibility="collapsed")
+            new_rs = st.number_input("重置%", value=float(s_rs), step=0.1, key=f"rs_{stock['id']}", label_visibility="collapsed")
+            if new_th != s_th or new_rs != s_rs:
+                st.session_state.my_stocks[idx]["threshold"] = new_th
+                st.session_state.my_stocks[idx]["reset"] = new_rs
+                save_user_stocks(browser_id, st.session_state.my_stocks); st.rerun()
+            if st.button("🗑", key=f"del_{stock['id']}", use_container_width=True):
+                st.session_state.my_stocks.pop(idx); save_user_stocks(browser_id, st.session_state.my_stocks); st.rerun()
+    else:
+        st.error(f"無法取得 {stock['name']} 資料")
