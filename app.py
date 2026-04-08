@@ -5,89 +5,90 @@ import plotly.graph_objects as go
 from datetime import datetime
 import time
 
-# 設定網頁標題與佈局
-st.set_page_config(page_title="台股即時監控儀表板", layout="wide")
+# 設定網頁標題
+st.set_page_config(page_title="AKShare 台股監控儀表板", layout="wide")
 
-## --- 功能函式庫 ---
-
-@st.cache_data(ttl=60)  # 緩存 60 秒，避免頻繁請求被封鎖
-def get_tw_stock_realtime(symbol):
-    """
-    獲取台股即時行情 (AKShare 接口可能隨版本更新，此處以通用邏輯示範)
-    註：AKShare 獲取台股通常透過個股代碼，例如 '0050'
-    """
+@st.cache_data(ttl=30)
+def fetch_realtime_data():
+    """抓取即時報價 - 使用東方財富插件"""
     try:
-        # 使用 akshare 抓取台股行情數據
-        # 這裡建議使用 stock_zh_a_spot_em 的邏輯，但需過濾台股代碼
-        # 或者使用專門的台股接口（若 AKShare 當時版本支援）
-        df = ak.stock_hk_spot_em() # 舉例：部分版本台股在海外/特定接口
-        # 實務上推薦：使用 yfinance 作為台股備援，或 AKShare 的通用個股接口
-        df = ak.stock_tw_spot_em() # 最新版 AKShare 支援台股接口
-        return df[df['代碼'] == symbol]
-    except Exception as e:
-        return None
-
-def get_history_data(symbol, period="daily"):
-    """獲取歷史 K 線數據"""
-    # 這裡以 0050 為例，轉換格式
-    try:
-        df = ak.stock_tw_hist(symbol=symbol, period=period, start_date="20240101")
+        # 抓取全球即時行情快照
+        df = ak.stock_zh_a_spot_em()
         return df
-    except:
+    except Exception as e:
+        st.error(f"即時數據抓取失敗: {e}")
         return pd.DataFrame()
 
-## --- Streamlit 介面設計 ---
+@st.cache_data(ttl=3600)
+def fetch_history_data(symbol):
+    """抓取歷史數據 - 使用通用歷史接口"""
+    try:
+        # AKShare 歷史數據接口，這裡使用通用格式
+        # 註：若此接口在您的地區受限，建議搭配 yfinance 作為備援
+        df = ak.stock_us_hist(symbol=f"116.{symbol}", period="daily", start_date="20240101", adjust="qfq")
+        return df
+    except:
+        # 備援：嘗試另一個常見的台股歷史接口
+        try:
+            df = ak.stock_hk_hist(symbol=symbol, period="daily", start_date="20240101", adjust="qfq")
+            return df
+        except:
+            return pd.DataFrame()
 
-st.title("📈 台股即時/歷史股價監控")
+# --- 介面設計 ---
 
-# 側邊欄：輸入參數
+st.title("📈 台股即時監控 (AKShare 穩定版)")
+
+# 側邊欄
 with st.sidebar:
-    st.header("設定")
-    stock_code = st.text_input("輸入股票代碼 (例如: 2330)", value="2330")
-    auto_refresh = st.checkbox("開啟自動刷新 (每 30 秒)", value=False)
+    st.header("搜尋設定")
+    input_code = st.text_input("請輸入股票代碼", value="2330")
+    refresh_btn = st.button("手動整理")
+    auto_refresh = st.checkbox("自動刷新 (30s)")
+
+# 數據處理邏輯
+all_data = fetch_realtime_data()
+
+if not all_data.empty:
+    # 在東方財富數據中，台股通常被歸類在特定區塊，我們透過代碼匹配
+    target_stock = all_data[all_data['代碼'] == input_code]
     
-    st.info("註：台股開盤時間為 09:00 - 13:30")
+    if not target_stock.empty:
+        stock_info = target_stock.iloc[0]
+        
+        # 顯示指標
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("最新價", f"{stock_info['最新價']}", f"{stock_info['漲跌幅']}%")
+        c2.metric("成交量", f"{stock_info['成交量']} 手")
+        c3.metric("最高", f"{stock_info['最高']}")
+        c4.metric("最低", f"{stock_info['最低']}")
+        
+        # 歷史圖表
+        st.subheader(f"{input_code} 走勢分析")
+        hist_df = fetch_history_data(input_code)
+        
+        if not hist_df.empty:
+            fig = go.Figure(data=[go.Candlestick(
+                x=hist_df['日期'],
+                open=hist_df['開盤'],
+                high=hist_df['最高'],
+                low=hist_df['最低'],
+                close=hist_df['收盤']
+            )])
+            fig.update_layout(xaxis_rangeslider_visible=False, height=450, margin=dict(l=20, r=20, t=20, b=20))
+            st.plotly_chart(fig, use_container_width=True)
+        else:
+            st.warning("暫時無法取得該代碼的歷史 K 線數據。")
+            
+        # 顯示原始清單 (供調試用)
+        with st.expander("查看即時數據源清單"):
+            st.dataframe(all_data.head(100))
+    else:
+        st.error(f"在即時清單中找不到代碼 {input_code}。請確認代碼是否正確，或嘗試更新 AKShare。")
+else:
+    st.warning("無法取得即時行情資料表。")
 
-# 主介面佈局
-col1, col2, col3 = st.columns(3)
-
-# 獲取數據
-try:
-    # 1. 抓取即時數據 (開盤中)
-    realtime_df = ak.stock_tw_spot_em()
-    stock_info = realtime_df[realtime_df['代碼'] == stock_code].iloc[0]
-
-    with col1:
-        st.metric("最新股價", f"{stock_info['最新價']}", f"{stock_info['漲跌幅']}%")
-    with col2:
-        st.metric("成交量", f"{stock_info['成交量']} 張")
-    with col3:
-        st.metric("最高/最低", f"{stock_info['最高']} / {stock_info['最低']}")
-
-    # 2. 繪製 K 線圖 (開盤後/歷史)
-    st.subheader(f"歷史走勢圖 - {stock_code}")
-    hist_df = ak.stock_tw_hist(symbol=stock_code, period="daily", start_date="20240101", adjust="qfq")
-    
-    if not hist_df.empty:
-        fig = go.Figure(data=[go.Candlestick(
-            x=hist_df['日期'],
-            open=hist_df['開盤'],
-            high=hist_df['最高'],
-            low=hist_df['最低'],
-            close=hist_df['收盤'],
-            name='K線'
-        )])
-        fig.update_layout(xaxis_rangeslider_visible=False, height=500)
-        st.plotly_chart(fig, use_container_width=True)
-    
-    # 3. 顯示原始數據表格
-    with st.expander("查看詳細數據表"):
-        st.write(hist_df.tail(10))
-
-except Exception as e:
-    st.error(f"無法獲取數據，請檢查代碼是否正確。錯誤訊息: {e}")
-
-# 自動刷新邏輯
+# 自動刷新
 if auto_refresh:
     time.sleep(30)
     st.rerun()
