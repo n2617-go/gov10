@@ -1,4 +1,10 @@
-akshare
 streamlit
+yfinance
+FinMind
 pandas
-plotly
+requests
+pytz
+tqdm
+ta
+extra-streamlit-components
+akshare
