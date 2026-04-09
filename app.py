@@ -89,11 +89,14 @@ def get_browser_id_component():
             localStorage.setItem(KEY, bid);
         }}
         const url = new URL(window.parent.location.href);
-        if (url.searchParams.get("bid") !== bid) {{
+        const currentBid = url.searchParams.get("bid");
+        if (currentBid !== bid) {{
+            // URL 的 bid 不對：靜默更新 URL 後 reload 一次
             url.searchParams.set("bid", bid);
             window.parent.history.replaceState(null, "", url.toString());
             window.parent.location.reload();
         }}
+        // bid 已正確：不做任何事，避免無限 redirect
     }})();
     </script>
     """, height=0)
@@ -167,28 +170,40 @@ def save_alert_state(bid: str, state: dict):
 # ===========================================================================
 
 def load_tg_config() -> dict:
-    if os.path.exists(TG_SAVE_FILE):
-        try:
-            with open(TG_SAVE_FILE, "r", encoding="utf-8") as f:
-                return json.load(f)
-        except Exception:
-            pass
-    return {
+    """
+    載入設定檔。app 重啟後自動還原所有設定。
+    """
+    defaults = {
         "tg_token": "", "tg_chat_id": "",
         "tg_threshold": 3.0, "tg_reset": 1.0,
         "finmind_token": "",
     }
+    if os.path.exists(TG_SAVE_FILE):
+        try:
+            with open(TG_SAVE_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            # 補齊缺少的 key，相容舊格式
+            for k, v in defaults.items():
+                data.setdefault(k, v)
+            return data
+        except Exception:
+            pass
+    return defaults
 
 
 def save_tg_config():
-    with open(TG_SAVE_FILE, "w", encoding="utf-8") as f:
-        json.dump({
-            "tg_token":      st.session_state.tg_token,
-            "tg_chat_id":    st.session_state.tg_chat_id,
-            "tg_threshold":  st.session_state.tg_threshold,
-            "tg_reset":      st.session_state.tg_reset,
-            "finmind_token": st.session_state.finmind_token,
-        }, f, ensure_ascii=False, indent=4)
+    """儲存所有設定，app 重啟後自動還原。"""
+    try:
+        with open(TG_SAVE_FILE, "w", encoding="utf-8") as f:
+            json.dump({
+                "tg_token":      st.session_state.tg_token,
+                "tg_chat_id":    st.session_state.tg_chat_id,
+                "tg_threshold":  st.session_state.tg_threshold,
+                "tg_reset":      st.session_state.tg_reset,
+                "finmind_token": st.session_state.finmind_token,
+            }, f, ensure_ascii=False, indent=4)
+    except Exception:
+        pass
 
 
 # ===========================================================================
@@ -328,68 +343,88 @@ def classify_short_implication(pct: float, ratio: float, tg_threshold: float) ->
     return ""
 
 
-def fetch_momentum_analysis(stock_id: str, pct: float = 0.0,
-                             tg_threshold: float = 3.0) -> dict:
-    """
-    抓取該股票最近 6 根 1 分 K，計算：
-    - 當前成交量（最新一根）
-    - 前 5 分鐘均量
-    - 量能比（當前量 / 均量）
-    - 動能判斷標籤
-    - 短線意涵（四種情境）
-    回傳 dict，失敗回傳空 dict。
-    """
+def _calc_momentum_from_1min_df(df: pd.DataFrame, vol_col: str,
+                                 pct: float, tg_threshold: float) -> dict:
+    """共用：從 1 分 K DataFrame 計算動能指標。"""
+    df = df.copy()
+    df[vol_col] = pd.to_numeric(df[vol_col], errors="coerce").fillna(0)
+    recent = df.tail(6)
+    if len(recent) < 2:
+        return {}
+    cur_vol = float(recent.iloc[-1][vol_col])
+    avg_vol = float(recent.iloc[:-1][vol_col].mean())
+    ratio   = cur_vol / avg_vol if avg_vol > 0 else 0.0
+    if ratio >= 2.0:
+        lbl = "🔥 爆量（{:.1f} 倍均量）".format(ratio)
+    elif ratio >= 1.5:
+        lbl = "📈 放量（{:.1f} 倍均量）".format(ratio)
+    elif ratio >= 1.0:
+        lbl = "➡️ 量能正常（{:.1f} 倍均量）".format(ratio)
+    else:
+        lbl = "📉 縮量（均量 {:.0f}%）".format(ratio * 100)
+    return {
+        "cur_vol":        int(cur_vol),
+        "avg_vol":        int(avg_vol),
+        "ratio":          round(ratio, 2),
+        "momentum_label": lbl,
+        "short_impl":     classify_short_implication(pct, ratio, tg_threshold),
+    }
+
+
+def _fetch_momentum_finmind(stock_id: str, pct: float, tg_threshold: float) -> dict:
+    """FinMind 1 分 K 動能（需 token 且方法存在）。"""
     try:
         dl    = get_finmind_loader()
         today = today_str()
-
-        df = dl.taiwan_stock_minute(
-            stock_id   = stock_id,
-            start_date = today,
-            end_date   = today,
-        )
+        # 新版 FinMind 方法名稱：taiwan_stock_kbar
+        fetch_fn = getattr(dl, "taiwan_stock_kbar",
+                   getattr(dl, "taiwan_stock_minute", None))
+        if fetch_fn is None:
+            return {}
+        df = fetch_fn(stock_id=stock_id, date=today)
         if df is None or df.empty:
             return {}
-
-        vol_col = None
-        for col in ["volume", "Volume", "vol"]:
-            if col in df.columns:
-                vol_col = col
-                break
+        vol_col = next((c for c in ["volume", "Volume", "vol"] if c in df.columns), None)
         if vol_col is None:
             return {}
+        if "date" in df.columns:
+            df = df.sort_values("date")
+        return _calc_momentum_from_1min_df(df, vol_col, pct, tg_threshold)
+    except Exception:
+        return {}
 
-        df = df.sort_values("date") if "date" in df.columns else df
-        df[vol_col] = pd.to_numeric(df[vol_col], errors="coerce").fillna(0)
 
-        recent = df.tail(6)
-        if len(recent) < 2:
-            return {}
+def _fetch_momentum_yfinance(stock_id: str, pct: float, tg_threshold: float) -> dict:
+    """yfinance 1 分 K 動能備援（不需 Token）。"""
+    for suffix in [".TW", ".TWO"]:
+        try:
+            df = yf.download(stock_id + suffix, period="1d",
+                             interval="1m", progress=False)
+            if df is None or df.empty:
+                continue
+            if isinstance(df.columns, pd.MultiIndex):
+                df.columns = df.columns.get_level_values(0)
+            if "Volume" not in df.columns:
+                continue
+            return _calc_momentum_from_1min_df(df, "Volume", pct, tg_threshold)
+        except Exception:
+            continue
+    return {}
 
-        cur_vol = float(recent.iloc[-1][vol_col])
-        avg_vol = float(recent.iloc[:-1][vol_col].mean())
-        ratio   = cur_vol / avg_vol if avg_vol > 0 else 0.0
 
-        if ratio >= 2.0:
-            momentum_label = "🔥 爆量（{:.1f} 倍均量）".format(ratio)
-        elif ratio >= 1.5:
-            momentum_label = "📈 放量（{:.1f} 倍均量）".format(ratio)
-        elif ratio >= 1.0:
-            momentum_label = "➡️ 量能正常（{:.1f} 倍均量）".format(ratio)
-        else:
-            momentum_label = "📉 縮量（均量 {:.0f}%）".format(ratio * 100)
-
-        short_impl = classify_short_implication(pct, ratio, tg_threshold)
-
-        return {
-            "cur_vol":        int(cur_vol),
-            "avg_vol":        int(avg_vol),
-            "ratio":          round(ratio, 2),
-            "momentum_label": momentum_label,
-            "short_impl":     short_impl,
-        }
-    except Exception as e:
-        return {"error": str(e)}
+def fetch_momentum_analysis(stock_id: str, pct: float = 0.0,
+                             tg_threshold: float = 3.0) -> dict:
+    """
+    抓取最近 6 根 1 分 K 計算動能。
+    優先用 FinMind，失敗時自動 fallback 到 yfinance。
+    """
+    token = st.session_state.get("finmind_token", "")
+    if token:
+        result = _fetch_momentum_finmind(stock_id, pct, tg_threshold)
+        if result and "momentum_label" in result:
+            return result
+    # yfinance 備援
+    return _fetch_momentum_yfinance(stock_id, pct, tg_threshold)
 
 
 # ===========================================================================
